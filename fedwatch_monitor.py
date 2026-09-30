@@ -4,9 +4,10 @@ Monitor de probabilidades de tipos de la Fed (metodología CME FedWatch)
 con avisos por Telegram solo cuando cambian.
 
 Cálculo (igual que FedWatch):
-  - Tipo antes de la reunión = EFFR actual (NY Fed).
-  - Tipo esperado después    = 100 - precio del futuro Fed Funds (ZQ) del mes
-                               siguiente a la reunión (noviembre no tiene reunión).
+  - Tipo esperado después    = 100 - precio del futuro Fed Funds (ZQ) de noviembre
+                               (mes sin reunión).
+  - Tipo antes de la reunión = el que implica el futuro de octubre
+                               (si falta, la EFFR publicada por la NY Fed).
   - La diferencia se reparte entre los dos escenarios de 25 pb más cercanos.
 
 Variables de entorno:
@@ -76,21 +77,36 @@ def get_effr() -> dict:
     }
 
 
-def post_meeting_rate(effr: float) -> tuple[float, str]:
-    """Tipo implícito tras la reunión. Usa el mes siguiente; si falla, el mes de la reunión."""
-    y, m = next_month(MEETING)
-    tk = zq_ticker(y, m)
+def market_rates(effr: float) -> tuple[float, float, str]:
+    """
+    Como FedWatch: tipo POST reunión = futuro del mes siguiente (sin reunión);
+    tipo PRE reunión = el que implica el futuro del mes de la reunión.
+    Si falta algún futuro, usa la EFFR publicada.
+    """
+    days = calendar.monthrange(MEETING.year, MEETING.month)[1]
+    d_before = MEETING.day                     # el nuevo tipo aplica desde el día siguiente
+    d_after = days - d_before
+    tk_m = zq_ticker(MEETING.year, MEETING.month)
+    tk_n = zq_ticker(*next_month(MEETING))
+    p_m = p_n = None
     try:
-        price = last_price(tk)
-        return 100 - price, f"{tk} {price:.4f}"
+        p_m = last_price(tk_m)
     except Exception:
-        tk = zq_ticker(MEETING.year, MEETING.month)
-        price = last_price(tk)
-        days = calendar.monthrange(MEETING.year, MEETING.month)[1]
-        d_before = MEETING.day                 # el nuevo tipo aplica desde el día siguiente
-        d_after = days - d_before
-        avg = 100 - price
-        return (avg * days - effr * d_before) / d_after, f"{tk} {price:.4f}"
+        pass
+    try:
+        p_n = last_price(tk_n)
+    except Exception:
+        pass
+    if p_m is not None and p_n is not None:
+        post = 100 - p_n
+        pre = ((100 - p_m) * days - post * d_after) / d_before
+        return pre, post, f"{tk_m} {p_m:.4f} | {tk_n} {p_n:.4f}"
+    if p_n is not None:
+        return effr, 100 - p_n, f"{tk_n} {p_n:.4f}"
+    if p_m is not None:
+        post = ((100 - p_m) * days - effr * d_before) / d_after
+        return effr, post, f"{tk_m} {p_m:.4f}"
+    raise RuntimeError("Sin precios de futuros ZQ")
 
 
 def probabilities(effr: float, post: float, lo: float, hi: float) -> dict[str, float]:
@@ -162,8 +178,8 @@ def check(force: bool = False) -> None:
         print("La reunión ya pasó. Actualiza MEETING en el script.")
         return
     info = get_effr()
-    post, src = post_meeting_rate(info["effr"])
-    probs = probabilities(info["effr"], post, info["lo"], info["hi"])
+    pre, post, src = market_rates(info["effr"])
+    probs = probabilities(pre, post, info["lo"], info["hi"])
     state = load_state()
     prev = state.get("probs", {})
     first = not prev or state.get("meeting") != MEETING.isoformat()
